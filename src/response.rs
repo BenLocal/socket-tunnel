@@ -7,13 +7,22 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseWarpper {
     request_id: String,
+    tunnel_id: Option<String>,
     status: u16,
     headers: Vec<(String, String)>,
     body: Option<String>,
 }
 
 impl ResponseWarpper {
-    pub async fn from_response(request_id: &str, response: Response) -> Self {
+    pub fn tunnel_id(&self) -> Option<&str> {
+        self.tunnel_id.as_deref()
+    }
+
+    pub async fn from_response(
+        request_id: String,
+        tunnel_id: Option<String>,
+        response: Response,
+    ) -> Self {
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -23,36 +32,42 @@ impl ResponseWarpper {
         let mut body_stream = response.into_body().into_data_stream();
         let mut base64_body = String::new();
         if let Some(Ok(body)) = body_stream.next().await {
+            println!("body:{}", String::from_utf8_lossy(&body));
             let en = general_purpose::STANDARD.encode(body);
             base64_body.push_str(&en);
         }
 
         Self {
-            request_id: String::from(request_id),
+            request_id,
             status: status,
             headers: headers,
             body: Some(base64_body),
+            tunnel_id,
         }
     }
 
-    pub fn new_bad_response(request_id: &str) -> Self {
+    pub fn new_bad_response(request_id: String, tunnel_id: Option<String>) -> Self {
         Self {
-            request_id: String::from(request_id),
+            request_id,
             status: StatusCode::BAD_REQUEST.as_u16(),
             headers: vec![],
             body: None,
+            tunnel_id,
         }
     }
 
-    pub fn to_response(&self) -> Response {
+    pub fn to_response(&self) -> anyhow::Result<Response> {
         let mut builder = Response::builder().status(self.status);
 
         for (header, value) in &self.headers {
             builder = builder.header(header, value);
         }
 
-        builder
-            .body(Body::from(self.body.clone().unwrap()))
-            .unwrap()
+        Ok(if let Some(body) = &self.body {
+            let de = general_purpose::STANDARD.decode(body)?;
+            builder.body(Body::from(de))?
+        } else {
+            builder.body(Body::empty())?
+        })
     }
 }

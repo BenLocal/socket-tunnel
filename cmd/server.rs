@@ -13,6 +13,7 @@ use axum::routing::any;
 use axum::{Router, response::Html, routing::get};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt as _};
+use hyper::HeaderMap;
 use pingora::prelude::*;
 use pingora::{
     prelude::HttpPeer,
@@ -101,10 +102,15 @@ impl WebsocketTunnelRequest {
         let id = uuid::Uuid::new_v4().to_string();
         Self { id, on_response }
     }
+
+    pub fn request_id(&self) -> &str {
+        return &self.id;
+    }
 }
 
 pub struct WebsocketConnect {
     pub id: String,
+    // pub who: SocketAddr,
     pub socket: SplitSink<WebSocket, Message>,
 }
 
@@ -144,54 +150,65 @@ async fn handler() -> Html<&'static str> {
 
 async fn ws_forward(
     State(state): State<Arc<WebsocketConnectState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Result<Response, StatusCode> {
     let mut connects = state.connects.write().await;
     let (tx, rx) = tokio::sync::oneshot::channel::<Bytes>();
 
-    let id = "a";
-
-    let w = RequestWarpper::from_request(id, req).await;
-    let json = serde_json::to_string(&w).map_err(|_| StatusCode::BAD_REQUEST)?;
-    info!("request: {}", json);
-    let tunnel = WebsocketTunnelRequest::new(tx);
-    state
-        .message
-        .write()
+    let mut w = RequestWarpper::from_request(req)
         .await
-        .insert(tunnel.id.clone(), tunnel);
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    match connects.get_mut("a") {
+    let res = match connects.get_mut(w.connect_id()) {
         Some(connect) => {
+            let tunnel = WebsocketTunnelRequest::new(tx);
+            let tunnel_id = tunnel.id.to_string();
+            state
+                .message
+                .write()
+                .await
+                .insert(tunnel.id.clone(), tunnel);
+            w.set_tunnel_id(&tunnel_id);
+            let json = serde_json::to_string(&w).map_err(|_| StatusCode::BAD_REQUEST)?;
+            info!("request: {}", json);
             connect
                 .socket
                 .send(Message::Binary(json.into()))
                 .await
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let resp = rx.await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            serde_json::from_slice::<ResponseWarpper>(&resp).map_err(|_| StatusCode::BAD_REQUEST)?
         }
         None => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let res = match rx.await {
-        Ok(bytes) => serde_json::from_slice::<ResponseWarpper>(&bytes)
-            .map_err(|_| StatusCode::BAD_REQUEST)?,
-        Err(_) => return Err(StatusCode::BAD_REQUEST),
-    };
-
-    Ok(res.to_response())
+    Ok(res.to_response().map_err(|_| StatusCode::BAD_REQUEST)?)
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-
+    headers: HeaderMap,
+    //ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<WebsocketConnectState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, headers))
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<WebsocketConnectState>) {
-    let id = "a";
+async fn handle_socket(
+    socket: WebSocket,
+    state: Arc<WebsocketConnectState>,
+    headers: HeaderMap,
+    //who: SocketAddr,
+) {
+    let id = match headers
+        .iter()
+        .find(|x| x.0 == "X-CONNECT-ID")
+        .map(|v| v.1.to_str().ok())
+        .flatten()
+    {
+        Some(id) => id,
+        None => return,
+    };
     let (sink, mut stream) = socket.split();
 
     {
@@ -200,6 +217,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebsocketConnectState>) {
             id.to_string(),
             WebsocketConnect {
                 id: id.to_string(),
+                // who,
                 socket: sink,
             },
         );
@@ -213,9 +231,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebsocketConnectState>) {
             String::from_utf8_lossy(&data)
         );
 
-        let mut rev = state.message.write().await;
-        if let Some(tunnel) = rev.remove(&id.to_string()) {
-            tunnel.on_response.send(data).unwrap();
+        let resp = serde_json::from_slice::<ResponseWarpper>(&data);
+        if let Ok(resp) = resp {
+            let mut rev = state.message.write().await;
+            let tunnel_id = resp.tunnel_id();
+            if let Some(tunnel_id) = tunnel_id {
+                if let Some(tunnel) = rev.remove(tunnel_id) {
+                    tunnel.on_response.send(data).unwrap();
+                }
+            }
         }
     }
 

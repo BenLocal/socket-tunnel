@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestWarpper {
     request_id: String,
+    tunnel_id: Option<String>,
     url: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
@@ -15,7 +16,29 @@ pub struct RequestWarpper {
 }
 
 impl RequestWarpper {
-    pub async fn from_request(request_id: &str, request: Request) -> Self {
+    pub fn set_tunnel_id(&mut self, tunnel_id: &str) {
+        self.tunnel_id = Some(tunnel_id.to_string());
+    }
+
+    pub fn connect_id(&self) -> &str {
+        return &self.request_id;
+    }
+
+    pub fn tunnel_id(&self) -> Option<&str> {
+        return self.tunnel_id.as_deref();
+    }
+
+    pub async fn from_request(request: Request) -> anyhow::Result<Self> {
+        let id = match request
+            .headers()
+            .iter()
+            .find(|x| x.0 == "X-CONNECT-ID")
+            .map(|v| v.1.to_str().ok().to_owned())
+            .flatten()
+        {
+            Some(id) => id.to_string(),
+            None => return Err(anyhow::anyhow!("Has no connect id")),
+        };
         let url = request.uri().to_string();
         let headers = request
             .headers()
@@ -30,13 +53,14 @@ impl RequestWarpper {
             let en = general_purpose::STANDARD.encode(body);
             base64_body.push_str(&en);
         }
-        Self {
-            request_id: request_id.to_string(),
+        Ok(Self {
+            request_id: id,
             url,
             headers,
             method,
             body: Some(base64_body),
-        }
+            tunnel_id: None,
+        })
     }
 
     pub fn to_request(&self) -> anyhow::Result<Request<Body>> {
