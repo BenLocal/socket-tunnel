@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -143,6 +144,7 @@ async fn handler() -> Html<&'static str> {
 
 async fn ws_forward(
     State(state): State<Arc<WebsocketConnectState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
 ) -> Result<Response, StatusCode> {
     let mut connects = state.connects.write().await;
