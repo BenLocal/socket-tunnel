@@ -9,7 +9,7 @@ use pingora::{
 use socket_tunnel::{request::RequestWarpper, response::ResponseWarpper};
 use tokio_tungstenite::connect_async;
 
-const SERVER: &str = "ws://127.0.0.1:6188/tunnel/ws";
+const SERVER: &str = "ws://127.0.0.1:3000/tunnel/ws";
 
 type Client = hyper_util::client::legacy::Client<HttpConnector, Body>;
 
@@ -49,23 +49,30 @@ impl BackendService {
                 msg = receiver.next() => {
                     if let Some(Ok(msg)) = msg {
                         // send to backend service
-                        let req_w: RequestWarpper = serde_json::from_slice(&msg.into_data())?;
-                        let req =  req_w.to_request();
-                        let res = self.client
-                            .request(req)
-                            .await;
-                        let resp_w = if let Ok(res) = res {
+                        let resp_w = if let Ok(res) = self.handle(msg).await {
                             ResponseWarpper::from_response("", res.into_response()).await
                         } else {
                             ResponseWarpper::new_bad_response("")
                         };
                         let json = serde_json::to_vec(&resp_w)?;
                         sender.send(tokio_tungstenite::tungstenite::Message::Binary(json.into())).await?;
+                    } else {
+                        break;
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    async fn handle(
+        &self,
+        msg: tokio_tungstenite::tungstenite::Message,
+    ) -> anyhow::Result<impl IntoResponse> {
+        let req_w: RequestWarpper = serde_json::from_slice(&msg.into_data())?;
+        let req = req_w.to_request()?;
+        let res = self.client.request(req).await?;
+        Ok(res.into_response())
     }
 }
 

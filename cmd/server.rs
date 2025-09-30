@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, Request, State, WebSocketUpgrade};
+use axum::extract::{Request, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -19,22 +20,33 @@ use pingora::{
     services::Service,
 };
 use socket_tunnel::request::RequestWarpper;
-use tokio::net::unix::SocketAddr;
+use socket_tunnel::response::ResponseWarpper;
 use tokio::sync::RwLock;
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
     let mut my_server = Server::new(None)?;
     my_server.bootstrap();
 
     my_server.add_service(WebsocketService);
 
-    let mut proxy_service = http_proxy_service(&my_server.configuration, ProxyTunnel);
-    proxy_service.add_tcp("0.0.0.0:6188");
-    my_server.add_service(proxy_service);
+    // let mut proxy_service = http_proxy_service(&my_server.configuration, ProxyTunnel);
+    // proxy_service.add_tcp("0.0.0.0:6188");
+    // my_server.add_service(proxy_service);
 
-    println!("socket tunnel proxy started on 0.0.0.0:6188");
-    println!("Waiting for agent connections via WebSocket...");
+    // println!("socket tunnel proxy started on 0.0.0.0:6188");
+    // println!("Waiting for agent connections via WebSocket...");
     my_server.run_forever();
 }
 
@@ -92,7 +104,6 @@ impl WebsocketTunnelRequest {
 
 pub struct WebsocketConnect {
     pub id: String,
-    pub who: SocketAddr,
     pub socket: SplitSink<WebSocket, Message>,
 }
 
@@ -105,11 +116,11 @@ pub async fn start_websocket_server(mut shutdown: ShutdownWatch) -> anyhow::Resu
     let app = Router::new()
         .route("/tunnel/healthz", get(handler))
         .route("/tunnel/ws", any(ws_handler))
-        .route("/*", any(ws_forward))
+        .fallback(ws_forward)
         .with_state(state);
 
     // run it
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:6188")
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
         .await
         .unwrap();
     info!("admin server listening on {}", listener.local_addr()?);
@@ -137,7 +148,9 @@ async fn ws_forward(
     let mut connects = state.connects.write().await;
     let (tx, rx) = tokio::sync::oneshot::channel::<Bytes>();
 
-    let w = RequestWarpper::from_request(req).await;
+    let id = "a";
+
+    let w = RequestWarpper::from_request(id, req).await;
     let json = serde_json::to_string(&w).map_err(|_| StatusCode::BAD_REQUEST)?;
     info!("request: {}", json);
     let tunnel = WebsocketTunnelRequest::new(tx);
@@ -158,29 +171,24 @@ async fn ws_forward(
         None => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let respone = match rx.await {
-        Ok(_) => Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::empty())
-            .unwrap(),
-        Err(_) => Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::empty())
-            .unwrap(),
+    let res = match rx.await {
+        Ok(bytes) => serde_json::from_slice::<ResponseWarpper>(&bytes)
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
 
-    Ok(respone)
+    Ok(res.to_response())
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+
     State(state): State<Arc<WebsocketConnectState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, addr, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, who: SocketAddr, state: Arc<WebsocketConnectState>) {
+async fn handle_socket(socket: WebSocket, state: Arc<WebsocketConnectState>) {
     let id = "a";
     let (sink, mut stream) = socket.split();
 
@@ -190,7 +198,6 @@ async fn handle_socket(socket: WebSocket, who: SocketAddr, state: Arc<WebsocketC
             id.to_string(),
             WebsocketConnect {
                 id: id.to_string(),
-                who,
                 socket: sink,
             },
         );
