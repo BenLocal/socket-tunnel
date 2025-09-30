@@ -1,10 +1,219 @@
-use pingora::server::Server;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use axum::body::{Body, Bytes};
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{ConnectInfo, Request, State, WebSocketUpgrade};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use axum::{Router, response::Html, routing::get};
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt as _};
+use pingora::prelude::*;
+use pingora::{
+    prelude::HttpPeer,
+    proxy::Session,
+    server::{ListenFds, Server, ShutdownWatch},
+    services::Service,
+};
+use socket_tunnel::request::RequestWarpper;
+use tokio::net::unix::SocketAddr;
+use tokio::sync::RwLock;
+use tracing::info;
 
 fn main() -> anyhow::Result<()> {
     let mut my_server = Server::new(None)?;
     my_server.bootstrap();
 
-    println!("socket tunnel proxy started on 0.0.0.0:8080");
+    my_server.add_service(WebsocketService);
+
+    let mut proxy_service = http_proxy_service(&my_server.configuration, ProxyTunnel);
+    proxy_service.add_tcp("0.0.0.0:6188");
+    my_server.add_service(proxy_service);
+
+    println!("socket tunnel proxy started on 0.0.0.0:6188");
     println!("Waiting for agent connections via WebSocket...");
     my_server.run_forever();
+}
+
+pub struct ProxyTunnel;
+
+#[async_trait]
+impl ProxyHttp for ProxyTunnel {
+    type CTX = ();
+    fn new_ctx(&self) -> () {
+        ()
+    }
+
+    async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
+        Ok(Box::new(HttpPeer::new(
+            "127.0.0.1:3000",
+            false,
+            "app".to_string(),
+        )))
+    }
+}
+
+pub struct WebsocketService;
+
+#[async_trait]
+impl Service for WebsocketService {
+    async fn start_service(&mut self, _fds: Option<ListenFds>, shutdown: ShutdownWatch, _: usize) {
+        let _ = start_websocket_server(shutdown.clone()).await;
+    }
+
+    fn name(&self) -> &str {
+        "AdminService"
+    }
+
+    fn threads(&self) -> Option<usize> {
+        Some(1)
+    }
+}
+
+pub struct WebsocketConnectState {
+    pub connects: RwLock<HashMap<String, WebsocketConnect>>,
+    pub message: RwLock<HashMap<String, WebsocketTunnelRequest>>,
+}
+
+pub struct WebsocketTunnelRequest {
+    pub id: String,
+    pub on_response: tokio::sync::oneshot::Sender<Bytes>,
+}
+
+impl WebsocketTunnelRequest {
+    pub fn new(on_response: tokio::sync::oneshot::Sender<Bytes>) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        Self { id, on_response }
+    }
+}
+
+pub struct WebsocketConnect {
+    pub id: String,
+    pub who: SocketAddr,
+    pub socket: SplitSink<WebSocket, Message>,
+}
+
+pub async fn start_websocket_server(mut shutdown: ShutdownWatch) -> anyhow::Result<()> {
+    let state = Arc::new(WebsocketConnectState {
+        connects: RwLock::new(HashMap::new()),
+        message: RwLock::new(HashMap::new()),
+    });
+
+    let app = Router::new()
+        .route("/tunnel/healthz", get(handler))
+        .route("/tunnel/ws", any(ws_handler))
+        .route("/*", any(ws_forward))
+        .with_state(state);
+
+    // run it
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:6188")
+        .await
+        .unwrap();
+    info!("admin server listening on {}", listener.local_addr()?);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                  info!("admin server shutdown");
+                },
+            }
+        })
+        .await?;
+
+    Ok(())
+}
+
+async fn handler() -> Html<&'static str> {
+    Html("<h1>Hello, World!</h1>")
+}
+
+async fn ws_forward(
+    State(state): State<Arc<WebsocketConnectState>>,
+    req: Request,
+) -> Result<Response, StatusCode> {
+    let mut connects = state.connects.write().await;
+    let (tx, rx) = tokio::sync::oneshot::channel::<Bytes>();
+
+    let w = RequestWarpper::from_request(req).await;
+    let json = serde_json::to_string(&w).map_err(|_| StatusCode::BAD_REQUEST)?;
+    info!("request: {}", json);
+    let tunnel = WebsocketTunnelRequest::new(tx);
+    state
+        .message
+        .write()
+        .await
+        .insert(tunnel.id.clone(), tunnel);
+
+    match connects.get_mut("a") {
+        Some(connect) => {
+            connect
+                .socket
+                .send(Message::Binary(json.into()))
+                .await
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+        }
+        None => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let respone = match rx.await {
+        Ok(_) => Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap(),
+        Err(_) => Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::empty())
+            .unwrap(),
+    };
+
+    Ok(respone)
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<WebsocketConnectState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, addr, state))
+}
+
+async fn handle_socket(socket: WebSocket, who: SocketAddr, state: Arc<WebsocketConnectState>) {
+    let id = "a";
+    let (sink, mut stream) = socket.split();
+
+    {
+        info!("connect {} connected", id);
+        state.connects.write().await.insert(
+            id.to_string(),
+            WebsocketConnect {
+                id: id.to_string(),
+                who,
+                socket: sink,
+            },
+        );
+    }
+
+    while let Some(Ok(msg)) = stream.next().await {
+        let data = msg.into_data();
+        info!(
+            "connect {} received: {}",
+            id,
+            String::from_utf8_lossy(&data)
+        );
+
+        let mut rev = state.message.write().await;
+        if let Some(tunnel) = rev.remove(&id.to_string()) {
+            tunnel.on_response.send(data).unwrap();
+        }
+    }
+
+    {
+        let mut connects = state.connects.write().await;
+        if let Some(_) = connects.remove(id) {
+            info!("connect {} disconnected", id);
+        }
+    }
 }
