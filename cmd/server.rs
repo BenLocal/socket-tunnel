@@ -1,10 +1,7 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use axum::body::{Body, Bytes};
-use axum::extract::connect_info::ConnectInfo;
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Request, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -14,21 +11,16 @@ use axum::{Router, response::Html, routing::get};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt as _};
 use hyper::HeaderMap;
-use pingora::prelude::*;
-use pingora::{
-    prelude::HttpPeer,
-    proxy::Session,
-    server::{ListenFds, Server, ShutdownWatch},
-    services::Service,
-};
 use socket_tunnel::request::RequestWarpper;
 use socket_tunnel::response::ResponseWarpper;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -37,54 +29,14 @@ fn main() -> anyhow::Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+    let cancel = CancellationToken::new();
 
-    let mut my_server = Server::new(None)?;
-    my_server.bootstrap();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move { start_websocket_server(cancel_clone).await });
 
-    my_server.add_service(WebsocketService);
-
-    // let mut proxy_service = http_proxy_service(&my_server.configuration, ProxyTunnel);
-    // proxy_service.add_tcp("0.0.0.0:6188");
-    // my_server.add_service(proxy_service);
-
-    // println!("socket tunnel proxy started on 0.0.0.0:6188");
-    // println!("Waiting for agent connections via WebSocket...");
-    my_server.run_forever();
-}
-
-pub struct ProxyTunnel;
-
-#[async_trait]
-impl ProxyHttp for ProxyTunnel {
-    type CTX = ();
-    fn new_ctx(&self) -> () {
-        ()
-    }
-
-    async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
-        Ok(Box::new(HttpPeer::new(
-            "127.0.0.1:3000",
-            false,
-            "app".to_string(),
-        )))
-    }
-}
-
-pub struct WebsocketService;
-
-#[async_trait]
-impl Service for WebsocketService {
-    async fn start_service(&mut self, _fds: Option<ListenFds>, shutdown: ShutdownWatch, _: usize) {
-        let _ = start_websocket_server(shutdown.clone()).await;
-    }
-
-    fn name(&self) -> &str {
-        "AdminService"
-    }
-
-    fn threads(&self) -> Option<usize> {
-        Some(1)
-    }
+    tokio::signal::ctrl_c().await?;
+    cancel.cancel();
+    Ok(())
 }
 
 pub struct WebsocketConnectState {
@@ -114,7 +66,7 @@ pub struct WebsocketConnect {
     pub socket: SplitSink<WebSocket, Message>,
 }
 
-pub async fn start_websocket_server(mut shutdown: ShutdownWatch) -> anyhow::Result<()> {
+pub async fn start_websocket_server(shutdown: CancellationToken) -> anyhow::Result<()> {
     let state = Arc::new(WebsocketConnectState {
         connects: RwLock::new(HashMap::new()),
         message: RwLock::new(HashMap::new()),
@@ -134,7 +86,7 @@ pub async fn start_websocket_server(mut shutdown: ShutdownWatch) -> anyhow::Resu
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             tokio::select! {
-                _ = shutdown.changed() => {
+                _ = shutdown.cancelled() => {
                   info!("admin server shutdown");
                 },
             }

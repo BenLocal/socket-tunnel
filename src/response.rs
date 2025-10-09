@@ -4,6 +4,8 @@ use futures_util::StreamExt as _;
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use crate::stream::read_all_data_fold;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseWarpper {
     request_id: String,
@@ -29,19 +31,17 @@ impl ResponseWarpper {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
             .collect();
-        let mut body_stream = response.into_body().into_data_stream();
-        let mut base64_body = String::new();
-        if let Some(Ok(body)) = body_stream.next().await {
-            println!("body:{}", String::from_utf8_lossy(&body));
-            let en = general_purpose::STANDARD.encode(body);
-            base64_body.push_str(&en);
-        }
+        let body_stream = response.into_body().into_data_stream();
+        let body_tmpl = read_all_data_fold(body_stream).await.unwrap_or_default();
+
+        println!("body:{}", String::from_utf8_lossy(&body_tmpl));
+        let en = general_purpose::STANDARD.encode(body_tmpl);
 
         Self {
             request_id,
             status: status,
             headers: headers,
-            body: Some(base64_body),
+            body: Some(en),
             tunnel_id,
         }
     }
@@ -65,6 +65,7 @@ impl ResponseWarpper {
 
         Ok(if let Some(body) = &self.body {
             let de = general_purpose::STANDARD.decode(body)?;
+            println!("response body: {}", String::from_utf8_lossy(&de));
             builder.body(Body::from(de))?
         } else {
             builder.body(Body::empty())?

@@ -3,12 +3,20 @@ use std::str::FromStr;
 use axum::{body::Body, extract::Request, http::method};
 use base64::{Engine as _, engine::general_purpose};
 use futures_util::StreamExt;
+use hyper::Uri;
 use serde::{Deserialize, Serialize};
+
+use crate::stream::read_all_data_fold;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestWarpper {
     request_id: String,
     tunnel_id: Option<String>,
+    /// target scheme
+    scheme: String,
+    /// target host
+    host: String,
+    /// url path
     url: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
@@ -39,6 +47,27 @@ impl RequestWarpper {
             Some(id) => id.to_string(),
             None => return Err(anyhow::anyhow!("Has no connect id")),
         };
+        let host = match request
+            .headers()
+            .iter()
+            .find(|x| x.0 == "X-CONNECT-HOST")
+            .map(|v| v.1.to_str().ok().to_owned())
+            .flatten()
+        {
+            Some(id) => id.to_string(),
+            None => return Err(anyhow::anyhow!("Has no connect host")),
+        };
+        let scheme = match request
+            .headers()
+            .iter()
+            .find(|x| x.0 == "X-CONNECT-SCHEME")
+            .map(|v| v.1.to_str().ok().to_owned())
+            .flatten()
+        {
+            Some(id) => id.to_string(),
+            None => "http".to_string(),
+        };
+
         let url = request.uri().to_string();
         let headers = request
             .headers()
@@ -46,26 +75,24 @@ impl RequestWarpper {
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
             .collect();
         let method = request.method().to_string();
-        let mut body_stream = request.into_body().into_data_stream();
-
-        let mut base64_body = String::new();
-        if let Some(Ok(body)) = body_stream.next().await {
-            let en = general_purpose::STANDARD.encode(body);
-            base64_body.push_str(&en);
-        }
+        let body_stream = request.into_body().into_data_stream();
+        let body_tmpl = read_all_data_fold(body_stream).await?;
         Ok(Self {
+            scheme,
+            host: host,
             request_id: id,
             url,
             headers,
             method,
-            body: Some(base64_body),
+            body: Some(general_purpose::STANDARD.encode(body_tmpl)),
             tunnel_id: None,
         })
     }
 
     pub fn to_request(&self) -> anyhow::Result<Request<Body>> {
+        let uri = format!("{}://{}{}", self.scheme, self.host, self.url);
         let mut builder = Request::builder()
-            .uri(self.url.clone())
+            .uri(uri.parse::<Uri>()?)
             .method(method::Method::from_str(&self.method)?);
 
         for (header, value) in &self.headers {
