@@ -1,6 +1,5 @@
 use axum::{body::Body, response::Response};
 use base64::{Engine as _, engine::general_purpose};
-use futures_util::StreamExt as _;
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 

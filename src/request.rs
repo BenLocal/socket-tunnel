@@ -2,7 +2,6 @@ use std::str::FromStr;
 
 use axum::{body::Body, extract::Request, http::method};
 use base64::{Engine as _, engine::general_purpose};
-use futures_util::StreamExt;
 use hyper::Uri;
 use serde::{Deserialize, Serialize};
 

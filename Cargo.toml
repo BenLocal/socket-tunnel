@@ -30,3 +30,4 @@ hyper-util = { version = "0.1.1", features = ["client-legacy"] }
 base64 = "0.22.1"
 http-body-util = "0.1.3"
 bytes = "1.4.0"
+clap = { version = "4.4", features = ["derive"] }
